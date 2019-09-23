@@ -59,7 +59,10 @@ var onKey = function ( event ) {
 
     if ( this._keyHandlers[ key ] ) {
         this._keyHandlers[ key ]( this, event, range );
-    } else if ( key.length === 1 && !range.collapsed ) {
+    // !event.isComposing stops us from blatting Kana-Kanji conversion in Safari
+    } else if ( !range.collapsed && !event.isComposing &&
+            !event.ctrlKey && !event.metaKey &&
+            ( event.key || key ).length === 1 ) {
         // Record undo checkpoint.
         this.saveUndoState( range );
         // Delete the selection
@@ -145,7 +148,7 @@ var afterDelete = function ( self, range ) {
 var keyHandlers = {
     enter: function ( self, event, range ) {
         var root = self._root;
-        var block, parent, nodeAfterSplit;
+        var block, parent, node, offset, nodeAfterSplit;
 
         // We handle this ourselves
         event.preventDefault();
@@ -166,9 +169,64 @@ var keyHandlers = {
 
         block = getStartBlockOfRange( range, root );
 
+        // Inside a PRE, insert literal newline, unless on blank line.
+        if ( block && ( parent = getNearest( block, root, 'PRE' ) ) ) {
+            moveRangeBoundariesDownTree( range );
+            node = range.startContainer;
+            offset = range.startOffset;
+            if ( node.nodeType !== TEXT_NODE ) {
+                node = self._doc.createTextNode( '' );
+                parent.insertBefore( node, parent.firstChild );
+            }
+            // If blank line: split and insert default block
+            if ( !event.shiftKey &&
+                    ( node.data.charAt( offset - 1 ) === '\n' ||
+                        rangeDoesStartAtBlockBoundary( range, root ) ) &&
+                    ( node.data.charAt( offset ) === '\n' ||
+                        rangeDoesEndAtBlockBoundary( range, root ) ) ) {
+                node.deleteData( offset && offset - 1, offset ? 2 : 1 );
+                nodeAfterSplit =
+                    split( node, offset && offset - 1, root, root );
+                node = nodeAfterSplit.previousSibling;
+                if ( !node.textContent ) {
+                    detach( node );
+                }
+                node = self.createDefaultBlock();
+                nodeAfterSplit.parentNode.insertBefore( node, nodeAfterSplit );
+                if ( !nodeAfterSplit.textContent ) {
+                    detach( nodeAfterSplit );
+                }
+                range.setStart( node, 0 );
+            } else {
+                node.insertData( offset, '\n' );
+                fixCursor( parent, root );
+                // Firefox bug: if you set the selection in the text node after
+                // the new line, it draws the cursor before the line break still
+                // but if you set the selection to the equivalent position
+                // in the parent, it works.
+                if ( node.length === offset + 1 ) {
+                    range.setStartAfter( node );
+                } else {
+                    range.setStart( node, offset + 1 );
+                }
+            }
+            range.collapse( true );
+            self.setSelection( range );
+            self._updatePath( range, true );
+            self._docWasChanged();
+            return;
+        }
+
         // If this is a malformed bit of document or in a table;
         // just play it safe and insert a <br>.
-        if ( !block || /^T[HD]$/.test( block.nodeName ) ) {
+        if ( !block || event.shiftKey || /^T[HD]$/.test( block.nodeName ) ) {
+            // If inside an <a>, move focus out
+            parent = getNearest( range.endContainer, root, 'A' );
+            if ( parent ) {
+                parent = parent.parentNode;
+                moveRangeBoundariesUpTree( range, parent, parent, root );
+                range.collapse( false );
+            }
             insertNodeInRange( range, self.createElement( 'BR' ) );
             range.collapse( false );
             self.setSelection( range );
@@ -181,11 +239,11 @@ var keyHandlers = {
             block = parent;
         }
 
-        if ( !block.textContent ) {
+        if ( isEmptyBlock( block ) ) {
             // Break list
             if ( getNearest( block, root, 'UL' ) ||
                     getNearest( block, root, 'OL' ) ) {
-                return self.modifyBlocks( decreaseListLevel, range );
+                return self.decreaseListLevel( range );
             }
             // Break blockquote
             else if ( getNearest( block, root, 'BLOCKQUOTE' ) ) {
@@ -239,10 +297,15 @@ var keyHandlers = {
             }
             nodeAfterSplit = child;
         }
-        range = self._createRange( nodeAfterSplit, 0 );
+        range = self.createRange( nodeAfterSplit, 0 );
         self.setSelection( range );
         self._updatePath( range, true );
     },
+
+    'shift-enter': function ( self, event, range ) {
+        return self._keyHandlers.enter( self, event, range );
+    },
+
     backspace: function ( self, event, range ) {
         var root = self._root;
         self._removeZWS();
@@ -274,7 +337,7 @@ var keyHandlers = {
                     return;
                 }
                 // Otherwise merge.
-                mergeWithBlock( previous, current, range );
+                mergeWithBlock( previous, current, range, root );
                 // If deleted line between containers, merge newly adjacent
                 // containers.
                 current = previous.parentNode;
@@ -292,7 +355,7 @@ var keyHandlers = {
                 // Break list
                 if ( getNearest( current, root, 'UL' ) ||
                         getNearest( current, root, 'OL' ) ) {
-                    return self.modifyBlocks( decreaseListLevel, range );
+                    return self.decreaseListLevel( range );
                 }
                 // Break blockquote
                 else if ( getNearest( current, root, 'BLOCKQUOTE' ) ) {
@@ -341,7 +404,7 @@ var keyHandlers = {
                     return;
                 }
                 // Otherwise merge.
-                mergeWithBlock( current, next, range );
+                mergeWithBlock( current, next, range, root );
                 // If deleted line between containers, merge newly adjacent
                 // containers.
                 next = current.parentNode;
@@ -387,12 +450,12 @@ var keyHandlers = {
         if ( range.collapsed && rangeDoesStartAtBlockBoundary( range, root ) ) {
             node = getStartBlockOfRange( range, root );
             // Iterate through the block's parents
-            while ( parent = node.parentNode ) {
+            while ( ( parent = node.parentNode ) ) {
                 // If we find a UL or OL (so are in a list, node must be an LI)
                 if ( parent.nodeName === 'UL' || parent.nodeName === 'OL' ) {
                     // Then increase the list level
                     event.preventDefault();
-                    self.modifyBlocks( increaseListLevel, range );
+                    self.increaseListLevel( range );
                     break;
                 }
                 node = parent;
@@ -410,28 +473,33 @@ var keyHandlers = {
             if ( getNearest( node, root, 'UL' ) ||
                     getNearest( node, root, 'OL' ) ) {
                 event.preventDefault();
-                self.modifyBlocks( decreaseListLevel, range );
+                self.decreaseListLevel( range );
             }
         }
     },
     space: function ( self, _, range ) {
         var node, parent;
+        var root = self._root;
         self._recordUndoState( range );
-        addLinks( range.startContainer, self._root, self );
+        addLinks( range.startContainer, root, self );
         self._getRangeAndRemoveBookmark( range );
 
         // If the cursor is at the end of a link (<a>foo|</a>) then move it
         // outside of the link (<a>foo</a>|) so that the space is not part of
         // the link text.
         node = range.endContainer;
-        parent = node.parentNode;
-        if ( range.collapsed && parent.nodeName === 'A' &&
-                !node.nextSibling && range.endOffset === getLength( node ) ) {
-            range.setStartAfter( parent );
+        if ( range.collapsed && range.endOffset === getLength( node ) ) {
+            do {
+                if ( node.nodeName === 'A' ) {
+                    range.setStartAfter( node );
+                    break;
+                }
+            } while ( !node.nextSibling &&
+                ( node = node.parentNode ) && node !== root );
         }
         // Delete the selection if not collapsed
-        else if ( !range.collapsed ) {
-            deleteContentsOfRange( range, self._root );
+        if ( !range.collapsed ) {
+            deleteContentsOfRange( range, root );
             self._ensureBottomLine();
             self.setSelection( range );
             self._updatePath( range, true );
@@ -490,6 +558,7 @@ keyHandlers[ ctrlKey + 'shift-8' ] = mapKeyTo( 'makeUnorderedList' );
 keyHandlers[ ctrlKey + 'shift-9' ] = mapKeyTo( 'makeOrderedList' );
 keyHandlers[ ctrlKey + '[' ] = mapKeyTo( 'decreaseQuoteLevel' );
 keyHandlers[ ctrlKey + ']' ] = mapKeyTo( 'increaseQuoteLevel' );
+keyHandlers[ ctrlKey + 'd' ] = mapKeyTo( 'toggleCode' );
 keyHandlers[ ctrlKey + 'y' ] = mapKeyTo( 'redo' );
 keyHandlers[ ctrlKey + 'z' ] = mapKeyTo( 'undo' );
 keyHandlers[ ctrlKey + 'shift-z' ] = mapKeyTo( 'redo' );
